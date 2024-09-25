@@ -1,0 +1,2 @@
+Main-Class: rriapi.Server 
+Class-Path: java-json.jar 

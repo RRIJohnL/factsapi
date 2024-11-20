@@ -18,6 +18,7 @@ import java.security.cert.X509Certificate;
 import java.util.Calendar;
 import java.util.Date;
 import java.util.concurrent.TimeUnit;
+import java.util.zip.GZIPOutputStream;
 
 import javax.net.ServerSocketFactory;
 import javax.net.ssl.HostnameVerifier;
@@ -55,8 +56,10 @@ class ServerThread extends Thread
     BufferedReader br=null;
     PrintWriter os=null;
     BufferedOutputStream bos=null;
+    OutputStream sos=null;
     Date[] notAfter;
-        
+    boolean gzip=false;
+
     ServerThread(SSLSocket socket,Date[] notAfter) throws IOException
     {
       this.socket=socket;
@@ -70,11 +73,11 @@ class ServerThread extends Thread
         try
         {
           InputStream inputStream=this.socket.getInputStream();
-          OutputStream outputStream=this.socket.getOutputStream();
+          this.sos=this.socket.getOutputStream();
 
           this.br=new BufferedReader(new InputStreamReader(inputStream));
-          this.os=new PrintWriter(new OutputStreamWriter(outputStream));
-          this.bos=new BufferedOutputStream(outputStream);
+          this.os=new PrintWriter(new OutputStreamWriter(this.sos));
+          this.bos=new BufferedOutputStream(this.sos);
           System.out.println("process");
           this.process();
         }
@@ -143,7 +146,7 @@ class ServerThread extends Thread
       int rb[]=new int[256];
       int bl=expr.length();
       int buf[];
- 
+
       for(i=0;i<pwdL;i++)keyB[i]=(int)pwd.charAt(i);
       for(i=0;i<256;i++)rb[i]=i;
 
@@ -154,7 +157,7 @@ class ServerThread extends Thread
         ly=(ly + rb[lx] + keyB[lx % (pwdL-1)]) % 256;
         i=rb[lx];
         rb[lx]=rb[ly];
-        rb[ly]=i; 
+        rb[ly]=i;
       }
 
       if(b)
@@ -206,24 +209,25 @@ class ServerThread extends Thread
       try
       {
         int cl=0;
-
-        while((this.line=this.br.readLine())!=null)
-        {
-          //System.out.println("Line "+this.line.length()+" "+this.line);
+        this.gzip=false;
+        while((this.line=this.br.readLine())!=null){
           if(line.trim().isEmpty())break;
           String a[]=this.line.split(":");
-          if(a.length==2 && a[0].indexOf("Content-Length")>=0)
-          {
-            a[1]=a[1].replaceAll("^\\p{IsWhite_Space}+|\\p{IsWhite_Space}+$", "");
-            cl=Integer.parseInt(a[1]);
+          if(a.length==2){
+            if(a[0].indexOf("Content-Length")>=0){
+              a[1]=a[1].replaceAll("^\\p{IsWhite_Space}+|\\p{IsWhite_Space}+$", "");
+              cl=Integer.parseInt(a[1]);
+            }
+            if(a[0].indexOf("Accept-Encoding")>=0 && a[1].indexOf("gzip")>=0)
+              this.gzip=true;
           }
         }
-
         this.os.println("HTTP/1.1 200 OK");
 		    this.os.println("Access-Control-Allow-Origin: *");
         this.os.println("Access-Control-Allow-Headers: Origin, Content-Type, Accept");
         this.os.println("Access-Controll-Allow-Methods: POST,OPTIONS");
         this.os.println("Content-Type: text/plain");
+        if(this.gzip) this.os.println("Content-Encoding: gzip");
         this.os.println("");
         this.os.flush();
 
@@ -232,12 +236,8 @@ class ServerThread extends Thread
         while(i<cl && (v=this.br.read()) != -1)
         {
           i++;
-          //System.out.println(" "+i +" "+v);
           sbb.append((char)v);
         }
-        //System.out.println("data "+i);
-
-            //System.out.println(sbb.toString());
       }
       catch(IOException e)
       {
@@ -254,7 +254,10 @@ class ServerThread extends Thread
           if(this.authenticate(jo))
           {
             if(jo.isNull("expire")==false)this.sslDays();
-            this.batch((JSONArray)jo.get("requests"));
+            if(jo.has("requests"))
+              this.batch((JSONArray)jo.get("requests"));
+            else if(jo.has("queries"))
+              this.sql((JSONArray)jo.get("queries"));
           }
         }
       }
@@ -267,6 +270,7 @@ class ServerThread extends Thread
 
     void sslDays() throws Exception
     {
+      GZIPOutputStream gos;
       byte[] bbuf;
       String sb="[";
       Date dtN=new Date();
@@ -278,20 +282,59 @@ class ServerThread extends Thread
       }
       sb+="]";
       bbuf = sb.getBytes("UTF-8");
-      this.bos.write(bbuf,0,sb.length());
-      this.bos.flush();
+      if(this.gzip){
+        gos=new GZIPOutputStream(this.sos);
+        gos.write(bbuf,0,sb.length());
+        gos.finish();
+      }
+      else{
+        this.bos.write(bbuf,0,sb.length());
+        this.bos.flush();
+      }
     }
 
+    public void sql(JSONArray ja) throws Exception {
+      GZIPOutputStream gos;
+      String sb;
+      int bw=0;
+      byte[] bbuf;
+      if(ja==null)return;
+      gos=new GZIPOutputStream(this.sos);
+      for(int i=0; i<ja.length() && bw<1500000;i++){
+        String query=ja.getString(i);
+        String[] command = {"/usr/pxpodbc/pxpsql","-c","Driver=PxPlus;RemotePVKIOHost=192.168.1.5;RemotePVKIOPort=20223;Catalog=FACTS75",query};
+        ProcessBuilder pb = new ProcessBuilder(command);
+        Process process=pb.start();
+        BufferedReader reader=new BufferedReader(new InputStreamReader(process.getInputStream()));
+        String line;
+        sb="";
+        while ((line=reader.readLine())!=null){
+          line=line.replaceAll("[^\\x00-\\x7F]","");
+          line+="\n";
+          bbuf = line.getBytes("UTF-8");
+          gos.write(bbuf,0,line.length());
+        }
+        //sb+=process.waitFor();
+        sb="~#+#~\n";
+        sb=sb.replaceAll("[^\\x00-\\x7F]", "");
+        bbuf = sb.getBytes("UTF-8");
+        gos.write(bbuf,0,sb.length());
+        //this.bos.flush();
+        bw+=sb.length();
+      }
+      gos.finish();
+    }
 
     public void batch(JSONArray ja) throws Exception
     {
       OutputStream aos;
+      GZIPOutputStream gos=null;
       String s,sb;
       int bw=0;
       byte[] bbuf;
 
       if(ja==null)return;
-
+      if(this.gzip)gos=new GZIPOutputStream(this.sos);
       for(int i=0; i<ja.length() && bw<1500000;i++)
       {
         JSONObject jo=ja.getJSONObject(i);
@@ -310,7 +353,7 @@ class ServerThread extends Thread
         s=s.replaceAll("%22","\"");
         sb="<?xml version=\"1.0\" encoding=\"UTF-8\"?><RequestBatch ConsumerKey=\"SLGTL69UHI\" Password=\"rr!nd\" DateTime=\"\"";
         sb+=" Serial=\"\"><Request RequestID=\""+jo.get("request")+"\" Company=\"01\" SerialID=\"\">"+s+"</Request></RequestBatch>";
-        
+
         byte[] bb=sb.getBytes();
         aos.write(bb);
         aos.close();
@@ -322,16 +365,20 @@ class ServerThread extends Thread
         while ((iR=rd.read(buf,0,1024))>0)sbf.append(buf,0,iR);
         rd.close();
         //System.out.println(sbf.toString());
-
         sb=sbf.toString()+"~#+#~";
         sb=sb.replaceAll("[^\\x00-\\x7F]", "");
         bbuf = sb.getBytes("UTF-8");
-        this.bos.write(bbuf,0,sb.length());
-        this.bos.flush();
+        if(this.gzip){
+          gos.write(bbuf,0,sb.length());
+        }
+        else{
+          this.bos.write(bbuf,0,sb.length());
+          this.bos.flush();
+        }
         bw+=sb.length();
-
         http.disconnect();
       }
+      if(this.gzip)gos.finish();
     }
 }
 
@@ -404,7 +451,7 @@ public class Server
         Socket s;
         ServerSocket ss;
         TLSServer tls;
-        
+
         try
         {
           SSLContext sc=SSLContext.getInstance("TLS");
